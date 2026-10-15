@@ -1579,11 +1579,24 @@ function convertDockerRunToCompose(?string $custom_docker_run_options = null)
 {
     $options = [];
     $compose_options = collect([]);
-    preg_match_all('/(--\w+(?:-\w+)*)(?:\s|=)?([^\s-]+)?/', $custom_docker_run_options, $matches, PREG_SET_ORDER);
+    $quotedValuePattern = <<<'REGEX'
+"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'
+REGEX;
+    preg_match_all(
+        '/\G\s*(-{2,}\w+(?:-\w+)*)(?:=('.$quotedValuePattern.'|(?!--)[^\s"\']*)|\s+('.$quotedValuePattern.'|(?!--)[^\s"\']+))?(?=\s|$)/',
+        $custom_docker_run_options ?? '',
+        $matches,
+        PREG_SET_ORDER | PREG_UNMATCHED_AS_NULL
+    );
+    $matchedOptions = implode('', array_column($matches, 0));
+    if (trim(substr($custom_docker_run_options ?? '', strlen($matchedOptions))) !== '') {
+        throw new InvalidArgumentException('Malformed Docker option.');
+    }
     $list_options = collect([
         '--cap-add',
         '--cap-drop',
         '--security-opt',
+        '--tmpfs',
         '--sysctl',
         '--ulimit',
         '--device',
@@ -1594,6 +1607,8 @@ function convertDockerRunToCompose(?string $custom_docker_run_options = null)
         '--cap-add' => 'cap_add',
         '--cap-drop' => 'cap_drop',
         '--security-opt' => 'security_opt',
+        '--read-only' => 'read_only',
+        '--tmpfs' => 'tmpfs',
         '--sysctl' => 'sysctls',
         '--device' => 'devices',
         '--init' => 'init',
@@ -1608,58 +1623,46 @@ function convertDockerRunToCompose(?string $custom_docker_run_options = null)
         '--entrypoint' => 'entrypoint',
     ]);
     foreach ($matches as $match) {
-        $option = $match[1];
+        $option = '--'.ltrim($match[1], '-');
+        $parsedValue = $match[2] ?? $match[3];
+        if ($parsedValue !== null && (str_starts_with($parsedValue, '"') || str_starts_with($parsedValue, "'"))) {
+            $quote = $parsedValue[0];
+            $parsedValue = substr($parsedValue, 1, -1);
+            if ($quote === '"') {
+                $parsedValue = preg_replace('/\\\\(["$`\\\\])/', '$1', $parsedValue);
+            }
+        }
+        if ($option === '--read-only') {
+            $options[$option] = match ($parsedValue === null ? null : strtolower($parsedValue)) {
+                null, 'true', 't', '1' => true,
+                'false', 'f', '0' => false,
+                default => throw new InvalidArgumentException('Invalid boolean for --read-only.'),
+            };
+
+            continue;
+        }
+        if (in_array($option, ['--security-opt', '--tmpfs'], true) && ($parsedValue === null || $parsedValue === '')) {
+            throw new InvalidArgumentException('Docker security and tmpfs options require a value.');
+        }
         if ($option === '--gpus') {
             $regexForParsingDeviceIds = '/device=([0-9A-Za-z-,]+)/';
-            preg_match($regexForParsingDeviceIds, $custom_docker_run_options, $device_matches);
+            preg_match($regexForParsingDeviceIds, $parsedValue ?? '', $device_matches);
             $value = $device_matches[1] ?? 'all';
             $options[$option][] = $value;
             $options[$option] = array_unique($options[$option]);
-        }
-        if ($option === '--hostname') {
-            // Match --hostname=value or --hostname value
-            $regexForParsingHostname = '/--hostname(?:=|\s+)([^\s]+)/';
-            preg_match($regexForParsingHostname, $custom_docker_run_options, $hostname_matches);
-            $value = $hostname_matches[1] ?? null;
-            if ($value && ! empty(trim($value))) {
-                $options[$option][] = $value;
-                $options[$option] = array_unique($options[$option]);
-            }
+
+            continue;
         }
         if ($option === '--entrypoint') {
-            $value = null;
-            // Match --entrypoint=value or --entrypoint value
-            // Handle quoted strings with escaped quotes: --entrypoint "python -c \"print('hi')\""
-            // Pattern matches: double-quoted (with escapes), single-quoted (with escapes), or unquoted values
-            if (preg_match(
-                '/--entrypoint(?:=|\s+)(?<raw>"(?:\\\\.|[^"])*"|\'(?:\\\\.|[^\'])*\'|[^\s]+)/',
-                $custom_docker_run_options,
-                $entrypoint_matches
-            )) {
-                $rawValue = $entrypoint_matches['raw'];
-                // Handle double-quoted strings: strip quotes and unescape special characters
-                if (str_starts_with($rawValue, '"') && str_ends_with($rawValue, '"')) {
-                    $inner = substr($rawValue, 1, -1);
-                    // Unescape backslash sequences: \" \$ \` \\
-                    $value = preg_replace('/\\\\(["$`\\\\])/', '$1', $inner);
-                } elseif (str_starts_with($rawValue, "'") && str_ends_with($rawValue, "'")) {
-                    // Handle single-quoted strings: just strip quotes (no unescaping per shell rules)
-                    $value = substr($rawValue, 1, -1);
-                } else {
-                    // Handle unquoted values
-                    $value = $rawValue;
-                }
-            }
-
-            if ($value && trim($value) !== '') {
-                $options[$option][] = $value;
+            if ($parsedValue && trim($parsedValue) !== '') {
+                $options[$option][] = $parsedValue;
                 $options[$option] = array_values(array_unique($options[$option]));
             }
 
             continue;
         }
-        if (isset($match[2]) && $match[2] !== '') {
-            $value = $match[2];
+        if ($parsedValue !== null && $parsedValue !== '') {
+            $value = $parsedValue;
             $options[$option][] = $value;
             $options[$option] = array_unique($options[$option]);
         } else {
