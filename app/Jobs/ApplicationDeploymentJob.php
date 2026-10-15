@@ -1408,7 +1408,7 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
 
     private function generate_image_names()
     {
-        if ($this->application->dockerfile) {
+        if ($this->application->dockerfile && $this->application->build_pack !== 'dockerimage') {
             if ($this->application->docker_registry_image_name) {
                 $this->build_image_name = "{$this->application->docker_registry_image_name}:build";
                 $this->production_image_name = "{$this->application->docker_registry_image_name}:latest";
@@ -4113,7 +4113,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $labels = $labels->merge(defaultLabels($this->application->uuid, $this->application->uuid, $this->application->project()->name, $this->application->name, $this->application->environment->name, $this->pull_request_id))->toArray();
 
         // Check for custom HEALTHCHECK
-        if ($this->application->build_pack === 'dockerfile' || $this->application->dockerfile) {
+        if ($this->application->build_pack !== 'dockerimage' && ($this->application->build_pack === 'dockerfile' || $this->application->dockerfile)) {
             $this->execute_remote_command([
                 executeInDocker($this->deployment_uuid, "cat {$this->workdir}{$this->dockerfile_location}"),
                 'hidden' => true,

@@ -124,3 +124,50 @@ it('keeps non-preview dockerfile image names commit based', function () {
     expect($names['production'])->toBe('preview-app:111222333444555666777888999000aaabbbccc1')
         ->and($names['build'])->toBe('preview-app:111222333444555666777888999000aaabbbccc1-build');
 });
+
+it('uses the configured docker image reference despite a stored inline Dockerfile', function (string $tag, string $expectedImage, ?string $dockerfile) {
+    $job = makePreviewImageNameJob(
+        commit: 'HEAD',
+        pullRequestId: 0,
+        registryImageName: 'registry.example.com/team/app',
+    );
+    $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
+    $application = $reflection->getProperty('application')->getValue($job);
+    $application->build_pack = 'dockerimage';
+    $application->dockerfile = $dockerfile;
+    $reflection->getProperty('dockerImage')->setValue($job, 'registry.example.com/team/app');
+    $reflection->getProperty('dockerImageTag')->setValue($job, $tag);
+
+    $reflection->getMethod('generate_image_names')->invoke($job);
+
+    expect($reflection->getProperty('production_image_name')->getValue($job))->toBe($expectedImage);
+})->with([
+    'release tag' => ['v1.2.3', 'registry.example.com/team/app:v1.2.3'],
+    'digest' => [
+        'sha256-'.str_repeat('a', 64),
+        'registry.example.com/team/app@sha256:'.str_repeat('a', 64),
+    ],
+])->with([
+    'stale inline Dockerfile' => ["FROM alpine:3.21\nHEALTHCHECK CMD true"],
+    'no inline Dockerfile' => [null],
+]);
+
+it('keeps inline Dockerfile image names for builds', function (?string $registryImageName, string $expectedImage) {
+    $job = makePreviewImageNameJob(
+        commit: 'HEAD',
+        pullRequestId: 0,
+        registryImageName: $registryImageName,
+    );
+    $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
+    $reflection->getProperty('application')->getValue($job)->dockerfile = 'FROM alpine:3.21';
+
+    $names = generatePreviewImageNames($job);
+
+    expect($names)->toBe([
+        'build' => $expectedImage.':build',
+        'production' => $expectedImage.':latest',
+    ]);
+})->with([
+    'registry image' => ['registry.example.com/team/app', 'registry.example.com/team/app'],
+    'application image' => [null, 'preview-app'],
+]);
