@@ -1870,6 +1870,11 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
             }
         }
 
+        if ($this->build_pack === 'dockerimage') {
+            $envs = $envs->reject(fn (string $env): bool => str_starts_with($env, 'COOLIFY_SERVER_UUID='))->values();
+            $envs->push('COOLIFY_SERVER_UUID='.$this->mainServer->uuid);
+        }
+
         // Return the generated environment variables instead of storing them globally
         return $envs;
     }

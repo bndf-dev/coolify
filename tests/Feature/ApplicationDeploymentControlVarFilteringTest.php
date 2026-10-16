@@ -7,16 +7,151 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationPreview;
 use App\Models\Environment;
 use App\Models\EnvironmentVariable;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
+use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Queue;
 use Symfony\Component\Process\Process;
 
 uses(RefreshDatabase::class);
+
+it('uses the destination server identity once for Docker image runtime environments', function (int $pullRequestId, array $productionValues, array $previewValues, ?string $generatedValue, bool $sort) {
+    [$application, $server] = makeDeploymentControlVarFixture(['build_pack' => 'dockerimage']);
+    $application->settings()->update(['is_env_sorting_enabled' => $sort]);
+    foreach ($productionValues as $value) {
+        createApplicationEnvironmentVariable($application, ['key' => 'COOLIFY_SERVER_UUID', 'value' => $value]);
+    }
+    $application->environment_variables_preview()->delete();
+    foreach ($previewValues as $value) {
+        createApplicationEnvironmentVariable($application, ['key' => 'COOLIFY_SERVER_UUID', 'value' => $value, 'is_preview' => true]);
+    }
+    createApplicationEnvironmentVariable($application, ['key' => 'NORMAL', 'value' => 'normal-value', 'is_preview' => $pullRequestId !== 0]);
+    createApplicationEnvironmentVariable($application, ['key' => 'COOLIFY_SERVER_UUID_SUFFIX', 'value' => 'unrelated-value', 'is_preview' => $pullRequestId !== 0]);
+    $recordsBefore = $application->environment_variables()->get()->merge($application->environment_variables_preview()->get())->map->getAttributes()->all();
+    [$job, $reflection] = makeControlVarFilteringJob($application, $server, ['pull_request_id' => $pullRequestId]);
+    $job->generatedEnvironmentOverrides = $generatedValue === null ? [] : ['COOLIFY_SERVER_UUID' => $generatedValue];
+
+    $environment = invokeDeploymentJobMethod($job, $reflection, 'generate_runtime_environment_variables');
+
+    expect($environment->filter(fn (string $value): bool => str_starts_with($value, 'COOLIFY_SERVER_UUID='))->values()->all())
+        ->toBe(['COOLIFY_SERVER_UUID='.$server->uuid]);
+    expect($environment->last())->toBe('COOLIFY_SERVER_UUID='.$server->uuid);
+    expect($environment->filter(fn (string $value): bool => str_starts_with($value, 'COOLIFY_RESOURCE_UUID='))->values()->all())
+        ->toBe(['COOLIFY_RESOURCE_UUID='.$application->uuid]);
+    expect($environment->all())->toContain(
+        'NORMAL="normal-value"',
+        'COOLIFY_SERVER_UUID_SUFFIX="unrelated-value"',
+    );
+    expect($application->environment_variables()->get()->merge($application->environment_variables_preview()->get())->map->getAttributes()->all())
+        ->toBe($recordsBefore);
+})->with([
+    'production without a stored identity' => [0, [], [], null],
+    'production zero shadow' => [0, ['0'], [], null],
+    'production one shadow' => [0, ['1'], [], null],
+    'production duplicate shadows' => [0, ['forged-first', 'forged-second'], [], null],
+    'production generated and stored shadows' => [0, ['forged-production'], [], 'forged-generated'],
+    'preview without a stored identity' => [42, [], [], null],
+    'preview one shadow' => [42, ['forged-production'], ['1'], null],
+    'preview production fallback shadow' => [42, ['forged-production'], [], null],
+    'preview duplicate shadows' => [42, [], ['forged-first', 'forged-second'], null],
+    'preview generated and stored shadows' => [42, ['forged-production'], ['forged-preview'], 'forged-generated'],
+])->with([false, true]);
+
+it('uses distinct queued destination identities for parent and additional Docker image deployments during a build-server detour', function () {
+    Http::preventStrayRequests();
+    Queue::fake([ApplicationDeploymentJob::class]);
+    InstanceSettings::unguarded(fn () => InstanceSettings::firstOrCreate(['id' => 0]));
+    [$application, $primaryServer] = makeDeploymentControlVarFixture([
+        'build_pack' => 'dockerimage',
+        'docker_registry_image_name' => 'ghcr.io/example/application',
+        'docker_registry_image_tag' => 'latest',
+    ]);
+    $primaryDestination = StandaloneDocker::where('server_id', $primaryServer->id)->firstOrFail();
+    $additionalServer = Server::factory()->create(['team_id' => $primaryServer->team_id]);
+    $additionalDestination = StandaloneDocker::where('server_id', $additionalServer->id)->firstOrFail();
+    $builder = Server::factory()->create(['team_id' => $primaryServer->team_id]);
+    $application->update(['destination_id' => $primaryDestination->id, 'destination_type' => StandaloneDocker::class]);
+    $application->additional_networks()->attach($additionalDestination->id, ['server_id' => $additionalServer->id]);
+    $application->refresh();
+    $parent = ApplicationDeploymentQueue::create([
+        'application_id' => $application->id,
+        'deployment_uuid' => 'server-identity-parent',
+        'server_id' => $primaryServer->id,
+        'destination_id' => $primaryDestination->id,
+        'commit' => 'HEAD',
+        'pull_request_id' => 0,
+    ]);
+    $parentJob = new ApplicationDeploymentJob($parent->id);
+    $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
+    expect(invokeDeploymentJobMethod($parentJob, $reflection, 'deploy_to_additional_destinations'))->toBe(1);
+    $child = ApplicationDeploymentQueue::where('parent_deployment_uuid', $parent->deployment_uuid)->sole();
+    $childJob = new ApplicationDeploymentJob($child->id);
+    $reflection->getProperty('server')->setValue($parentJob, $builder);
+    $reflection->getProperty('server')->setValue($childJob, $builder);
+
+    $parentEnvironment = invokeDeploymentJobMethod($parentJob, $reflection, 'generate_runtime_environment_variables');
+    $childEnvironment = invokeDeploymentJobMethod($childJob, $reflection, 'generate_runtime_environment_variables');
+
+    expect($parentEnvironment->filter(fn (string $value): bool => str_starts_with($value, 'COOLIFY_SERVER_UUID='))->values()->all())
+        ->toBe(['COOLIFY_SERVER_UUID='.$primaryServer->uuid]);
+    expect($childEnvironment->filter(fn (string $value): bool => str_starts_with($value, 'COOLIFY_SERVER_UUID='))->values()->all())
+        ->toBe(['COOLIFY_SERVER_UUID='.$additionalServer->uuid]);
+    expect($child->server_id)->toBe($additionalServer->id);
+    expect(readDeploymentJobProperty($childJob, $reflection, 'is_this_additional_server'))->toBeTrue();
+    Queue::assertPushed(ApplicationDeploymentJob::class, fn (ApplicationDeploymentJob $job): bool => $job->application_deployment_queue_id === $child->id);
+});
+
+it('writes the authoritative Docker image server identity without logging runtime values', function (int $pullRequestId) {
+    config()->set('app.env', 'local');
+    [$application, $server] = makeDeploymentControlVarFixture(['build_pack' => 'dockerimage']);
+    createApplicationEnvironmentVariable($application, ['key' => 'COOLIFY_SERVER_UUID', 'value' => 'forged-stored-identity', 'is_preview' => $pullRequestId !== 0]);
+    createApplicationEnvironmentVariable($application, ['key' => 'NORMAL', 'value' => 'preserved-runtime-value', 'is_preview' => $pullRequestId !== 0]);
+    [$job, $reflection] = makeControlVarFilteringJob($application, $server, [
+        'pull_request_id' => $pullRequestId,
+        'configuration_dir' => '/artifacts/configuration',
+    ]);
+    $job->generatedEnvironmentOverrides = ['COOLIFY_SERVER_UUID' => 'forged-generated-identity'];
+
+    invokeDeploymentJobMethod($job, $reflection, 'save_runtime_environment_variables');
+
+    expect(array_keys($job->writtenArtifacts))->toBe(['/artifacts/test-app/.env', '/artifacts/configuration/.env']);
+    foreach ($job->writtenArtifacts as $contents) {
+        expect(collect(explode("\n", $contents))->filter(fn (string $line): bool => str_starts_with($line, 'COOLIFY_SERVER_UUID='))->values()->all())
+            ->toBe(['COOLIFY_SERVER_UUID='.$server->uuid]);
+        expect($contents)->toContain('NORMAL="preserved-runtime-value"', 'COOLIFY_RESOURCE_UUID='.$application->uuid)
+            ->not->toContain('forged-stored-identity', 'forged-generated-identity');
+    }
+    expect(collect($job->recordedCommands)->flatten(1)->all())->toHaveCount(2)
+        ->each->toHaveKey('skip_command_log', true);
+    expect(implode("\n", $job->recordedLogEntries))
+        ->not->toContain($server->uuid, 'forged-stored-identity', 'forged-generated-identity', 'preserved-runtime-value');
+})->with([0, 42]);
+
+it('preserves server identity overrides for other build packs', function (string $buildPack, int $pullRequestId, ?string $value) {
+    [$application, $server] = makeDeploymentControlVarFixture([
+        'build_pack' => $buildPack,
+        'docker_compose' => 'services: {}',
+        'docker_compose_raw' => 'services: {}',
+    ]);
+    if ($value !== null) {
+        createApplicationEnvironmentVariable($application, ['key' => 'COOLIFY_SERVER_UUID', 'value' => $value]);
+    }
+    $application->environment_variables_preview()->where('key', 'COOLIFY_SERVER_UUID')->delete();
+    createApplicationEnvironmentVariable($application, ['key' => 'NORMAL', 'value' => 'normal-value', 'is_preview' => true]);
+    [$job, $reflection] = makeControlVarFilteringJob($application, $server, ['pull_request_id' => $pullRequestId]);
+
+    $environment = invokeDeploymentJobMethod($job, $reflection, 'generate_runtime_environment_variables');
+
+    $identityAssignments = $environment->filter(fn (string $assignment): bool => str_starts_with($assignment, 'COOLIFY_SERVER_UUID='))->values()->all();
+    expect($identityAssignments)->toBe($value === null ? [] : ['COOLIFY_SERVER_UUID="'.$value.'"']);
+})->with(['dockercompose', 'dockerfile', 'nixpacks', 'railpack', 'static'])->with([0, 42])->with([null, '0', 'manual-server']);
 
 it('does not persist environment write commands or generated Dockerfiles in deployment logs', function () {
     [$application, $server] = makeDeploymentControlVarFixture();
@@ -210,6 +345,8 @@ it('ignores empty and non-string remote secrets when redacting command output', 
 
 class TestableControlVarFilteringDeploymentJob extends ApplicationDeploymentJob
 {
+    public array $generatedEnvironmentOverrides = [];
+
     public array $recordedCommands = [];
 
     public array $recordedLogEntries = [];
@@ -219,6 +356,11 @@ class TestableControlVarFilteringDeploymentJob extends ApplicationDeploymentJob
     public ?string $writtenDockerfile = null;
 
     public function __construct() {}
+
+    protected function generate_coolify_env_variables(bool $forBuildTime = false): Collection
+    {
+        return parent::generate_coolify_env_variables($forBuildTime)->merge($this->generatedEnvironmentOverrides);
+    }
 
     public function execute_remote_command(...$commands)
     {
